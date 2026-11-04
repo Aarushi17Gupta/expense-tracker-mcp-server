@@ -1,13 +1,14 @@
 from fastmcp import FastMCP
 import json
 import os
+import sys
 import aiosqlite  # Changed: sqlite3 → aiosqlite
-import tempfile
-# Use temporary directory which should be writable
+
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "expenses.db")
 CATEGORIES_PATH = os.path.join(os.path.dirname(__file__), "categories.json")
+CREDIT_TYPES = ("salary", "credit")
 
-print(f"Database path: {DB_PATH}")
+print(f"Database path: {DB_PATH}", file=sys.stderr)
 
 mcp = FastMCP("ExpenseTracker")
 
@@ -27,12 +28,21 @@ def init_db():  # Keep as sync for initialization
                     note TEXT DEFAULT ''
                 )
             """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS credits(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    date TEXT NOT NULL,
+                    amount REAL NOT NULL,
+                    credit_type TEXT NOT NULL,
+                    note TEXT DEFAULT ''
+                )
+            """)
             # Test write access
             c.execute("INSERT OR IGNORE INTO expenses(date, amount, category) VALUES ('2000-01-01', 0, 'test')")
             c.execute("DELETE FROM expenses WHERE category = 'test'")
-            print("Database initialized successfully with write access")
+            print("Database initialized successfully with write access", file=sys.stderr)
     except Exception as e:
-        print(f"Database initialization error: {e}")
+        print(f"Database initialization error: {e}", file=sys.stderr)
         raise
 
 # Initialize database synchronously at module load
@@ -126,6 +136,68 @@ async def delete_expense(expense_id):
             return {"status": "success", "deleted": dict(row), "message": "Expense deleted successfully"}
     except Exception as e:
         return {"status": "error", "message": f"Database error: {str(e)}"}
+
+@mcp.tool()
+async def add_credit(date, amount, credit_type="credit", note=""):
+    '''Record money received. Use credit_type "salary" for salary and "credit" for any other income,
+    such as a refund or a transfer in. Use the note for details like the source.'''
+    if credit_type not in CREDIT_TYPES:
+        return {"status": "error", "message": f"Unknown credit_type '{credit_type}'. Valid: {list(CREDIT_TYPES)}"}
+    try:
+        async with aiosqlite.connect(DB_PATH) as c:
+            cur = await c.execute(
+                "INSERT INTO credits(date, amount, credit_type, note) VALUES (?,?,?,?)",
+                (date, amount, credit_type, note)
+            )
+            credit_id = cur.lastrowid
+            await c.commit()
+            return {"status": "success", "id": credit_id, "message": "Credit added successfully"}
+    except Exception as e:
+        return {"status": "error", "message": f"Database error: {str(e)}"}
+
+@mcp.tool()
+async def list_credits(start_date, end_date):
+    '''List salary and other credits within an inclusive date range.'''
+    try:
+        async with aiosqlite.connect(DB_PATH) as c:
+            cur = await c.execute(
+                """
+                SELECT id, date, amount, credit_type, note
+                FROM credits
+                WHERE date BETWEEN ? AND ?
+                ORDER BY date DESC, id DESC
+                """,
+                (start_date, end_date)
+            )
+            cols = [d[0] for d in cur.description]
+            return [dict(zip(cols, r)) for r in await cur.fetchall()]
+    except Exception as e:
+        return {"status": "error", "message": f"Error listing credits: {str(e)}"}
+
+@mcp.tool()
+async def get_balance(start_date, end_date):
+    '''Show total credits, total expenses and the balance (credits minus expenses) within an inclusive date range.'''
+    try:
+        async with aiosqlite.connect(DB_PATH) as c:
+            cur = await c.execute(
+                "SELECT COALESCE(SUM(amount), 0) FROM credits WHERE date BETWEEN ? AND ?",
+                (start_date, end_date)
+            )
+            total_credits = (await cur.fetchone())[0]
+            cur = await c.execute(
+                "SELECT COALESCE(SUM(amount), 0) FROM expenses WHERE date BETWEEN ? AND ?",
+                (start_date, end_date)
+            )
+            total_expenses = (await cur.fetchone())[0]
+            return {
+                "start_date": start_date,
+                "end_date": end_date,
+                "total_credits": total_credits,
+                "total_expenses": total_expenses,
+                "balance": total_credits - total_expenses
+            }
+    except Exception as e:
+        return {"status": "error", "message": f"Error calculating balance: {str(e)}"}
 
 @mcp.tool()
 async def list_expenses(start_date, end_date):  # Changed: added async
